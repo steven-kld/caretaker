@@ -63,13 +63,13 @@ export default function GuideScreen({ audioStream, screenStream }) {
         
         latestFrames.current = []
         startTime.current = Date.now()
-  
+        
+        captureFrame() // Initial frame
         frameInterval.current = setInterval(() => {
           captureFrame()
-        }, 2500)
+        }, 2000)
   
         timeout = setTimeout(() => {
-          console.log('⏲️ Timeout reached (15s) – stopping recording')
           stopRecordingAndProcess()
         }, 15000)
       }
@@ -81,14 +81,14 @@ export default function GuideScreen({ audioStream, screenStream }) {
             console.log('🔇 Silence started')
           }
           if (now - silenceStart > 1000) {
-            console.log('🛑 Silence > 1s – stopping recording')
+            console.log('🛑 Silence > 1s: stopping recording')
             clearTimeout(timeout)
             stopRecordingAndProcess()
             return
           }
         } else {
           if (silenceStart) {
-            console.log('🔊 Voice resumed – resetting silence timer')
+            console.log('🔊 Voice resumed: resetting silence timer')
           }
           silenceStart = null
         }
@@ -97,15 +97,14 @@ export default function GuideScreen({ audioStream, screenStream }) {
       if (agentState === 'waiting' || agentState === 'listening') {
         requestAnimationFrame(loop)
       } else {
-        console.log('⛔ Loop paused – current agentState:', agentState)
+        console.log('⛔ Loop paused: current agentState:', agentState)
       }
     }
   
     const stopRecordingAndProcess = () => {
       if (!recorderRef.current) return
       clearInterval(frameInterval.current)
-  
-      console.log('🛑 Stopping recorder and sending data')
+
       recorderRef.current.stopRecording(() => {
         const audioBlob = recorderRef.current.getBlob()
         const durationSeconds = Math.round((Date.now() - startTime.current) / 1000)
@@ -134,24 +133,20 @@ export default function GuideScreen({ audioStream, screenStream }) {
       canvas.toBlob(blob => {
         if (blob) {
           latestFrames.current.push(blob)
-          console.log(`📸 Captured frame #${latestFrames.current.length}`)
         }
       }, 'image/jpeg', 0.7)
     }
   
     const sendToBackend = async (audioBlob, frameBlobs) => {
-      console.log('📤 Sending to backend:', {
-        audioBlob,
-        frameCount: frameBlobs.length
-      })
-  
       const form = new FormData()
       form.append('audio', audioBlob, 'voice.webm')
   
-      frameBlobs.forEach((blob, i) => {
-        form.append('images', blob, `frame_${i}.jpg`)
-      })
-  
+      if (frameBlobs.length > 0) {
+        const middleIndex = Math.floor(frameBlobs.length / 2)
+        const selectedBlob = frameBlobs[middleIndex]
+        form.append('images', selectedBlob, `frame_${middleIndex}.jpg`)
+      }
+      
       fetch('/api/process', {
         method: 'POST',
         body: form
@@ -163,11 +158,9 @@ export default function GuideScreen({ audioStream, screenStream }) {
           player.src = url
           setAgentState('playing')
           document.title = 'playing'
-          console.log('🔊 Playing audio response')
           player.play()
   
           player.onended = () => {
-            console.log('🔁 Audio ended – resetting to waiting')
             setAgentState('waiting')
             document.title = 'waiting'
             requestAnimationFrame(loop)
