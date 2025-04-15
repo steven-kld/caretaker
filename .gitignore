@@ -1,0 +1,34 @@
+__pycache__/
+*.pyc
+*.pyo
+instance/
+.env
+.env.*
+
+# === Frontend Ignore ===
+
+# Build and dependency dirs
+frontend/node_modules/
+frontend/.vite/
+frontend/dist/
+frontend/dist-ssr/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Editor stuff
+.vscode/
+!.vscode/extensions.json
+.idea/
+.DS_Store
+
+# Other local files
+*.local
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
