@@ -18,6 +18,7 @@ export default function GuideScreen({ audioStream, screenStream }) {
   const latestFrames = useRef([])
   const frameInterval = useRef(null)
   const startTime = useRef(null)
+  const loopTimeout = useRef(null)
 
   useEffect(() => {
     if (videoRef.current && screenStream) {
@@ -27,28 +28,49 @@ export default function GuideScreen({ audioStream, screenStream }) {
 
   useEffect(() => {
     console.log('🟢 useEffect init: silence detection starting')
-    const audioCtx = new AudioContext()
-    const source = audioCtx.createMediaStreamSource(audioStream)
-    const analyser = audioCtx.createAnalyser()
-    analyser.fftSize = 1024
-  
-    const dataArray = new Float32Array(analyser.fftSize)
-    source.connect(analyser)
-  
-    audioCtxRef.current = audioCtx
-    analyserRef.current = analyser
-    dataArrayRef.current = dataArray
-  
+
+    let audioCtx, source, analyser, dataArray
+
+    const setupAudio = () => {
+      audioCtx = new AudioContext()
+      source = audioCtx.createMediaStreamSource(audioStream)
+      analyser = audioCtx.createAnalyser()
+      analyser.fftSize = 1024
+      dataArray = new Float32Array(analyser.fftSize)
+
+      source.connect(analyser)
+
+      audioCtxRef.current = audioCtx
+      analyserRef.current = analyser
+      dataArrayRef.current = dataArray
+    }
+
+    setupAudio()
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        const state = audioCtxRef.current?.state
+        if (state === 'suspended') {
+          audioCtxRef.current.resume().then(() => {
+            console.log('🔊 AudioContext resumed')
+            setupAudio() // rebuild pipeline
+          })
+        }
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisibility)
+
     let silenceStart = null
     let isRecording = false
     let recorder = null
     let timeout = null
-  
+
     const loop = () => {
       analyser.getFloatTimeDomainData(dataArray)
       const max = Math.max(...dataArray.map(Math.abs))
       const now = Date.now()
-  
+
       if (!isRecording && max > 0.15) {
         recorder = new RecordRTC(audioStream, {
           type: 'audio',
@@ -60,20 +82,20 @@ export default function GuideScreen({ audioStream, screenStream }) {
         isRecording = true
         setAgentState('listening')
         document.title = 'listening'
-        
+
         latestFrames.current = []
         startTime.current = Date.now()
-        
-        captureFrame() // Initial frame
+
+        captureFrame()
         frameInterval.current = setInterval(() => {
           captureFrame()
         }, 2000)
-  
+
         timeout = setTimeout(() => {
           stopRecordingAndProcess()
         }, 15000)
       }
-  
+
       if (isRecording) {
         if (max < 0.15) {
           if (!silenceStart) {
@@ -93,14 +115,14 @@ export default function GuideScreen({ audioStream, screenStream }) {
           silenceStart = null
         }
       }
-  
+
       if (agentState === 'waiting' || agentState === 'listening') {
-        requestAnimationFrame(loop)
+        loopTimeout.current = setTimeout(loop, 100)
       } else {
         console.log('⛔ Loop paused: current agentState:', agentState)
       }
     }
-  
+
     const stopRecordingAndProcess = () => {
       if (!recorderRef.current) return
       clearInterval(frameInterval.current)
@@ -108,7 +130,7 @@ export default function GuideScreen({ audioStream, screenStream }) {
       recorderRef.current.stopRecording(() => {
         const audioBlob = recorderRef.current.getBlob()
         const durationSeconds = Math.round((Date.now() - startTime.current) / 1000)
-  
+
         const framesToSend = latestFrames.current.slice(0, durationSeconds)
         isRecording = false
         recorderRef.current = null
@@ -118,35 +140,35 @@ export default function GuideScreen({ audioStream, screenStream }) {
         sendToBackend(audioBlob, framesToSend)
       })
     }
-  
+
     const captureFrame = () => {
       const video = videoRef.current
       const canvas = canvasRef.current
       if (!video || !canvas) return
-  
+
       canvas.width = video.videoWidth
       canvas.height = video.videoHeight
-  
+
       const ctx = canvas.getContext('2d')
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-  
+
       canvas.toBlob(blob => {
         if (blob) {
           latestFrames.current.push(blob)
         }
       }, 'image/jpeg', 0.7)
     }
-  
+
     const sendToBackend = async (audioBlob, frameBlobs) => {
       const form = new FormData()
       form.append('audio', audioBlob, 'voice.webm')
-  
+
       if (frameBlobs.length > 0) {
         const middleIndex = Math.floor(frameBlobs.length / 2)
         const selectedBlob = frameBlobs[middleIndex]
         form.append('images', selectedBlob, `frame_${middleIndex}.jpg`)
       }
-      
+
       fetch('/api/process', {
         method: 'POST',
         body: form
@@ -159,29 +181,31 @@ export default function GuideScreen({ audioStream, screenStream }) {
           setAgentState('playing')
           document.title = 'playing'
           player.play()
-  
+
           player.onended = () => {
             setAgentState('waiting')
             document.title = 'waiting'
-            requestAnimationFrame(loop)
+            loop()
           }
         })
         .catch(err => {
           console.error('❌ Failed to play audio:', err)
           setAgentState('waiting')
           document.title = 'waiting'
-          requestAnimationFrame(loop)
+          loop()
         })
     }
-  
+
     loop()
-  
+
     return () => {
       console.log('🧹 Cleaning up audio context + intervals')
       recorderRef.current?.stopRecording()
       clearTimeout(timeout)
       clearInterval(frameInterval.current)
-      audioCtx.close()
+      clearTimeout(loopTimeout.current)
+      audioCtx?.close()
+      document.removeEventListener('visibilitychange', handleVisibility)
     }
   }, [audioStream])
 
