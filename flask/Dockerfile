@@ -1,31 +1,46 @@
 # syntax=docker/dockerfile:1.4
-FROM --platform=$BUILDPLATFORM python:3.10-alpine AS builder
 
-WORKDIR /src
-RUN apk add --no-cache ffmpeg
-RUN ffmpeg -version
+# --- Stage 1: Builder ---
+    FROM python:3.10-bullseye AS builder
 
-COPY requirements.txt /src
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install -r requirements.txt
-
-COPY . .
-
-CMD ["python3", "app.py"]
-
-FROM builder as dev-envs
-
-RUN <<EOF
-apk update
-apk add git
-EOF
-
-RUN <<EOF
-addgroup -S docker
-adduser -S --shell /bin/bash --ingroup docker vscode
-EOF
-
-# install Docker tools (cli, buildx, compose)
-COPY --from=gloursdocker/docker / /
-
-CMD ["python3", "app.py"]
+    # Avoid interactive prompts
+    ENV DEBIAN_FRONTEND=noninteractive
+    
+    # Set working dir
+    WORKDIR /src
+    
+    # Install system dependencies
+    RUN apt-get update && apt-get install -y \
+        ffmpeg \
+        git \
+        swig \
+        && rm -rf /var/lib/apt/lists/*
+    
+    # Upgrade pip & wheel to avoid build issues
+    RUN pip install --upgrade pip setuptools wheel
+    
+    # Copy requirements and install early
+    COPY requirements.txt .
+    
+    # Install faiss-cpu first to ensure wheel install works
+    RUN --mount=type=cache,target=/root/.cache/pip \
+        pip install --prefer-binary faiss-cpu==1.8.0.post1
+    
+    # Then install the rest
+    RUN --mount=type=cache,target=/root/.cache/pip \
+        pip install --no-cache-dir -r requirements.txt
+    
+    # Copy source
+    COPY . .
+    
+    CMD ["python3", "app.py"]
+    
+    
+    # --- Optional Stage 2: Dev environment ---
+    FROM builder as dev-envs
+    
+    RUN addgroup --system docker && \
+        adduser --system --shell /bin/bash --ingroup docker vscode
+    
+    CMD ["python3", "app.py"]
+    

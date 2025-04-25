@@ -21,8 +21,13 @@ clean:
 	docker system prune -f
 
 prod: 
+	docker compose down --volumes
+	docker system prune -f
 	docker compose -f docker-compose.yaml -f docker-compose.prod.yaml up --build -d
 
+soft-prod:
+	docker compose -f docker-compose.yaml -f docker-compose.prod.yaml up --build -d
+	
 prod-build:
 	docker compose -f docker-compose.yaml -f docker-compose.prod.yaml build
 

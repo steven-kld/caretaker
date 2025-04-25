@@ -2,3 +2,17 @@ flask
 flask-cors
 requests
 openai
+faiss-cpu==1.8.0.post1
+numpy
+python-dotenv
+
+# --- FOR LOCAL MODELING ONLY ---
+
+# python-docx
+# transformers
+# Pillow
+# tiktoken 
+# torch==2.2.2+cpu
+# torchvision==0.17.2+cpu 
+# torchaudio==2.2.2+cpu 
+# --extra-index-url https://download.pytorch.org/whl/cpu
