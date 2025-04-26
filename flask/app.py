@@ -1,23 +1,20 @@
 from flask import Flask, request, jsonify, Response, session
 from flask_cors import CORS
-import os, base64, uuid
-from io import BytesIO
+import os, uuid, openai
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dotenv import load_dotenv
-import numpy as np
-import openai
+
 from utils.logging import LogManager
-from core.faiss_matcher import FaissMatcher
+from core.faiss_matcher import FaissMatcher, MatchAction
+from core.session_manager import SessionManager
+from core.process_manager import ProcessManager
 
 APP_FOLDER = os.path.dirname(os.path.abspath(__file__))
 
 app = Flask(__name__)
 CORS(app)
 app.secret_key = os.getenv("FLASK_SECRET_KEY")
-
-SESSION_STORE = {} # session_id -> {'history': [...]}
-MEMORY_LIMIT = 10
 
 log_manager = LogManager()
 
@@ -28,114 +25,74 @@ task_matcher = FaissMatcher(
 
 @app.route("/api/session/init", methods=['GET'])
 def init_session():
+    SessionManager.clear_expired_sessions()
+
     if not session.get('user_id'):
         session['user_id'] = str(uuid.uuid4())
     user_id = session['user_id']
 
-    # Create a logger per session and attach it
     logger = log_manager.get_session_logger(user_id)
+    SessionManager.init_session(user_id, logger)
 
-    if user_id in SESSION_STORE:
-        del SESSION_STORE[user_id]
-
-    SESSION_STORE[user_id] = {
-        "history": [],
-        "logger": logger
-    }
     logger.info(f"🆕 Session initialized and logger attached for uuid {user_id}")
-
     return jsonify({"ok": "hello dear", "session_id": user_id})
 
 @app.route('/api/process', methods=['POST'])
 def process():
     try:
-        session_id = session.get('user_id')
+        # --- Always needed preparations ---
+        session_id, logger = ProcessManager.prepare_session(session)
         if not session_id:
-            return jsonify({'error': 'Missing session_id'}), 400
-        
-        logger = SESSION_STORE[session_id]["logger"]
-        logger.start_timer()
+            return jsonify({'error': logger}), 400
+
         openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-        if session_id not in SESSION_STORE:
-            SESSION_STORE[session_id] = {'history': []}
-
-        audio = request.files.get('audio')
-        logger.log_time("📥 Audio received")
-
-        if not audio or not hasattr(audio.stream, 'read'):
-            return jsonify({'error': 'No valid audio file'}), 400
-
-        raw_bytes = audio.read()
-        if not raw_bytes:
-            return jsonify({'error': 'Empty audio stream'}), 400
-
-        buffer = BytesIO(raw_bytes)
-        buffer.name = audio.filename
-        logger.log_time("📦 Audio wrapped")
-
-        response = openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=buffer,
-            response_format="verbose_json"
-        )
-        logger.log_time("🧠 Whisper took")
-
-        if not response.text:
-            return jsonify({'error': 'Missing text'}), 400
+        text, error = ProcessManager.transcribe_audio(openai_client, logger)
+        if not text:
+            return jsonify({'error': error}), 400
         
-        # TODO! It locks only if not locked, then has to match and answer with exact step! LOCK -> DETAIL -> UNLOCK -> LOCK
-        if "matched_task" in SESSION_STORE[session_id]:
-            task_match = SESSION_STORE[session_id]["matched_task"]
-            logger.log_time(f"🔒 Reusing locked task: {task_match['title']}")
-            confidence = 0.0  # not relevant anymore
-        else:
-            task_match, confidence = task_matcher.match_task(logger, response.text, openai_client)
-            logger.log_time(f"User response text: {response.text}")
-            logger.info(f"Match confidence: {confidence:.4f}")
+        logger.info(f"Received user input: {text}")
 
-            if task_match:
-                SESSION_STORE[session_id]["matched_task"] = task_match
-                logger.info(f"📌 Task locked: {task_match['title']}")
-                logger.log_time("task locking")
-                logger.info(f"🧠 {task_match['intro'].splitlines()[0]}")
-            else:
-                logger.log_time("⚠️ No matching task found.")
+        vision_parts = ProcessManager.prepare_vision_parts(logger)
 
-        image_files = request.files.getlist("images")
+        # --- Matching and task handling ---
+        match_result = task_matcher.match_task_or_continue(session_id, text, openai_client, logger)
 
-        logger.log_time("🖼 Image encoding complete")
+        if match_result.action == MatchAction.LOCKED_NEW_TASK:
+            logger.log_time(f"📌 New task locked: {match_result.task['title']}")
 
-        with ThreadPoolExecutor() as executor:
-            encoded_images = list(executor.map(
-                lambda img: base64.b64encode(img.read()).decode("utf-8"),
-                image_files[:5]
-            ))
+        elif match_result.action == MatchAction.CONTINUING_TASK:
+            logger.log_time(f"➡️ Continuing task at step {match_result.step}")
 
-        vision_parts = [
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-            }
-            for b64 in encoded_images
-        ]
+        elif match_result.action == MatchAction.MISMATCH_UNLOCK:
+            logger.log_time("⛔ Mismatch detected, unlocked")
 
+        elif match_result.action == MatchAction.TASK_COMPLETED_UNLOCK:
+            logger.log_time("✅ Task completed, unlocked")
+
+        elif match_result.action == MatchAction.NO_MATCH_FOUND:
+            logger.log_time("⚠️ No matching task found")
+
+        # --- Generate final response ---
         mp3_data = generate_response(
             openai_client,
-            response.text,
+            text,
             vision_parts,
             session_id,
             logger,
-            matched_task=task_match
+            matched_task=match_result.task,
+            matched_step=match_result.step_info if hasattr(match_result, "step_info") else None
         )
+
         logger.log_time("🤖 GPT + TTS")
+
         if not mp3_data:
             return jsonify({'error': 'TTS failed'}), 500
 
         return Response(mp3_data, mimetype="audio/mpeg")
 
     except Exception as e:
-        logger.error("❌ Whisper failed:", e)
+        logger.error("❌ process failed:", e)
         return jsonify({'error': str(e)}), 500
 
 def generate_speech(openai_client, text, voice="nova"):
@@ -151,7 +108,7 @@ def generate_speech(openai_client, text, voice="nova"):
         print("❌ TTS failed:", e)
         return None
 
-def generate_response(openai_client, text, vision_parts, session_id, logger, matched_task=None, lang: str = "ru", ) -> str:
+def generate_response(openai_client, text, vision_parts, session_id, logger, matched_task=None, matched_step=None, lang: str = "ru"):
     system_prompt = (
         "Ты ассистент, который помогает с действиями на экране. "
         "Сначала напиши строку вида: intent: allowed или intent: rejected. "
@@ -167,21 +124,25 @@ def generate_response(openai_client, text, vision_parts, session_id, logger, mat
             f"Описание:\n{matched_task['intro'].strip()[:800]}"
         )
 
-    # Inject session history
-    history = SESSION_STORE.get(session_id, {}).get("history", [])[-MEMORY_LIMIT:]
+    if matched_step:
+        system_prompt += (
+            f"\n\nТекущий конкретный шаг:\n{matched_step.get('text', '')}"
+        )
+
+
+    history = SessionManager.get_history(session_id)
     history_text = "\n".join(
         f"Пользователь: {h['text']}\nАссистент: {h['reply']}" for h in history
     )
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-    ]
-
+    messages = [{"role": "system", "content": system_prompt}]
     if history_text:
         messages.append({"role": "system", "content": f"История взаимодействия:\n{history_text}"})
-
     messages.append({"role": "user", "content": text})
 
+    logger.info("RESPONSE PROMPT")
+    logger.info(messages)
+    
     try:
         chat = openai_client.chat.completions.create(
             model="gpt-4o" if vision_parts else "gpt-4",
@@ -194,8 +155,7 @@ def generate_response(openai_client, text, vision_parts, session_id, logger, mat
         if full_reply.lower().startswith("intent: rejected"):
             logger.info("⛔ Rejected prompt: %s", text[:100])
             trimmed = full_reply.split("\n", 1)[1].strip() if "\n" in full_reply else "Я не могу ответить на это."
-            SESSION_STORE[session_id]["history"].append({"text": text, "reply": trimmed})
-            SESSION_STORE[session_id]["history"] = SESSION_STORE[session_id]["history"][-MEMORY_LIMIT:]
+            SessionManager.save_history(session_id, text, trimmed)
             return generate_speech(openai_client, trimmed)
 
         if full_reply.lower().startswith("intent: allowed"):
@@ -207,8 +167,7 @@ def generate_response(openai_client, text, vision_parts, session_id, logger, mat
         if not reply or len(reply) < 20:
             reply = "Извините, я не смог определить следующий шаг."
 
-        SESSION_STORE[session_id]["history"].append({"text": text, "reply": reply})
-        SESSION_STORE[session_id]["history"] = SESSION_STORE[session_id]["history"][-MEMORY_LIMIT:]
+        SessionManager.save_history(session_id, text, reply)
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(generate_speech, openai_client, reply)
