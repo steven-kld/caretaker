@@ -91,3 +91,14 @@ class SessionManager:
         """Private helper to update session activity time."""
         if session_id in SESSION_STORE:
             SESSION_STORE[session_id]["updated_at"] = time.time()
+
+    @staticmethod
+    def set_step_vectors(session_id, vectors):
+        if session_id in SESSION_STORE:
+            SESSION_STORE[session_id]["step_vectors"] = vectors
+            SessionManager._refresh(session_id)
+
+    @staticmethod
+    def get_step_vectors(session_id):
+        SessionManager._refresh(session_id)
+        return SESSION_STORE.get(session_id, {}).get("step_vectors")

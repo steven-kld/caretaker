@@ -6,7 +6,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from utils.logging import LogManager
-from core.faiss_matcher import FaissMatcher, MatchAction
+from core.faiss_matcher import FaissMatcher, MatchStatus
 from core.session_manager import SessionManager
 from core.process_manager import ProcessManager
 
@@ -18,7 +18,7 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY")
 
 log_manager = LogManager()
 
-task_matcher = FaissMatcher(
+faiss_matcher = FaissMatcher(
     index_path=Path("./model/vector/task_index.faiss"),
     meta_path=Path("./model/vector/task_meta.json")
 )
@@ -47,41 +47,22 @@ def process():
 
         openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-        text, error = ProcessManager.transcribe_audio(openai_client, logger)
-        if not text:
+        query, error = ProcessManager.transcribe_audio(openai_client, logger)
+        if not query:
             return jsonify({'error': error}), 400
         
-        logger.info(f"Received user input: {text}")
-
-        vision_parts = ProcessManager.prepare_vision_parts(logger)
+        logger.info(f"Received user input: {query}")
 
         # --- Matching and task handling ---
-        match_result = task_matcher.match_task_or_continue(session_id, text, openai_client, logger)
-
-        if match_result.action == MatchAction.LOCKED_NEW_TASK:
-            logger.log_time(f"📌 New task locked: {match_result.task['title']}")
-
-        elif match_result.action == MatchAction.CONTINUING_TASK:
-            logger.log_time(f"➡️ Continuing task at step {match_result.step}")
-
-        elif match_result.action == MatchAction.MISMATCH_UNLOCK:
-            logger.log_time("⛔ Mismatch detected, unlocked")
-
-        elif match_result.action == MatchAction.TASK_COMPLETED_UNLOCK:
-            logger.log_time("✅ Task completed, unlocked")
-
-        elif match_result.action == MatchAction.NO_MATCH_FOUND:
-            logger.log_time("⚠️ No matching task found")
+        match_result = faiss_matcher.process(session_id, query, openai_client, logger)
 
         # --- Generate final response ---
         mp3_data = generate_response(
             openai_client,
-            text,
-            vision_parts,
+            query,
             session_id,
             logger,
-            matched_task=match_result.task,
-            matched_step=match_result.step_info if hasattr(match_result, "step_info") else None
+            match_result
         )
 
         logger.log_time("🤖 GPT + TTS")
@@ -107,70 +88,73 @@ def generate_speech(openai_client, text, voice="nova"):
     except Exception as e:
         print("❌ TTS failed:", e)
         return None
-
-def generate_response(openai_client, text, vision_parts, session_id, logger, matched_task=None, matched_step=None, lang: str = "ru"):
-    system_prompt = (
-        "Ты ассистент, который помогает с действиями на экране. "
-        "Сначала напиши строку вида: intent: allowed или intent: rejected. "
-        "- allowed: если запрос связан с действием или выбором на экране "
-        "- rejected: если запрос теоретический или выходит за рамки экранной помощи. "
-        "Затем выяви конкретный шаг, о котором идет речь. Объясни только этот шаг максимально подробно. Если не удается выявить шаг, в качестве ответа задай уточняющий вопрос"
-        "Если intent: rejected - скажи: 'Я помогаю только с действиями на экране. Спроси, что сделать.'"
-    )
-
-    if matched_task:
-        system_prompt += (
-            f"\nРядом подходящая инструкция: {matched_task['title']}.\n"
-            f"Описание:\n{matched_task['intro'].strip()[:800]}"
-        )
-
-    if matched_step:
-        system_prompt += (
-            f"\n\nТекущий конкретный шаг:\n{matched_step.get('text', '')}"
-        )
-
-
-    history = SessionManager.get_history(session_id)
-    history_text = "\n".join(
-        f"Пользователь: {h['text']}\nАссистент: {h['reply']}" for h in history
-    )
-
-    messages = [{"role": "system", "content": system_prompt}]
-    if history_text:
-        messages.append({"role": "system", "content": f"История взаимодействия:\n{history_text}"})
-    messages.append({"role": "user", "content": text})
-
-    logger.info("RESPONSE PROMPT")
-    logger.info(messages)
     
+
+def generate_response(openai_client, query, session_id, logger, match_result):
     try:
+        history = SessionManager.get_history(session_id)
+
+        system_prompt = (
+            "Ты помогаешь выполнять действия на экране. "
+            "Отвечай очень коротко и просто — 1–2 предложения. "
+            "Никаких лишних объяснений, никаких сложных фраз."
+        )
+
+        messages = [{"role": "system", "content": system_prompt}]
+
+        if history:
+            history_text = "\n".join(
+                f"Пользователь: {h['text']}\nАссистент: {h['reply']}" for h in history
+            )
+            messages.append({"role": "system", "content": f"История общения:\n{history_text}"})
+
+        # --- Three paths based on match result ---
+        if match_result.status == MatchStatus.MATCHED and match_result.step:
+            # ✅ Matched step: use step full text
+            user_content = (
+                f"Текущий шаг:\n{match_result.step.get('text', '')}\n\n"
+                f"Вопрос пользователя:\n{query}"
+            )
+            messages.append({"role": "user", "content": user_content})
+
+        elif match_result.status == MatchStatus.NO_STEP_MATCH and match_result.task:
+            # ✅ Matched task but no step: list steps
+            steps = match_result.task.get('steps', [])
+            steps_list = "\n".join(
+                f"- {step.get('text', '').strip()}" for step in steps
+            )
+            user_content = (
+                f"Есть такие шаги:\n{steps_list}\n\n"
+                f"Пользователь спросил:\n{query}\n\n"
+                "Помоги выбрать шаг. Ответь коротко, без лишних слов."
+            )
+            messages.append({"role": "user", "content": user_content})
+
+        elif match_result.status == MatchStatus.NO_TASK_MATCH:
+            # ❌ No task matched
+            reply = "Я не понял, что нужно сделать. Попробуйте переформулировать запрос."
+            SessionManager.save_history(session_id, query, reply)
+            return generate_speech(openai_client, reply)
+
+        # --- Call GPT ---
+        logger.info("RESPONSE PROMPT")
+        logger.info(messages)
+
         chat = openai_client.chat.completions.create(
-            model="gpt-4o" if vision_parts else "gpt-4",
+            model="gpt-4o",
             messages=messages
         )
         logger.log_time("🧠 GPT")
 
         full_reply = chat.choices[0].message.content.strip()
 
-        if full_reply.lower().startswith("intent: rejected"):
-            logger.info("⛔ Rejected prompt: %s", text[:100])
-            trimmed = full_reply.split("\n", 1)[1].strip() if "\n" in full_reply else "Я не могу ответить на это."
-            SessionManager.save_history(session_id, text, trimmed)
-            return generate_speech(openai_client, trimmed)
+        if not full_reply or len(full_reply) < 10:
+            full_reply = "Извините, не смог точно определить действие."
 
-        if full_reply.lower().startswith("intent: allowed"):
-            reply = full_reply.split("\n", 1)[1].strip() if "\n" in full_reply else "Окей, продолжим."
-        else:
-            logger.info("⚠️ Missing intent tag in GPT reply.")
-            reply = full_reply
-
-        if not reply or len(reply) < 20:
-            reply = "Извините, я не смог определить следующий шаг."
-
-        SessionManager.save_history(session_id, text, reply)
+        SessionManager.save_history(session_id, query, full_reply)
 
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(generate_speech, openai_client, reply)
+            future = executor.submit(generate_speech, openai_client, full_reply)
             mp3_data = future.result()
             logger.log_time("🔊 TTS")
 

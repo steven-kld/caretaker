@@ -8,6 +8,7 @@ import openai
 
 # --- CONFIG ---
 OPENAI_API_KEY="sk-proj-..."
+
 RAW_DIR = Path("raw")
 OUT_DIR = Path("instructions")
 MODEL = "gpt-4-turbo"
