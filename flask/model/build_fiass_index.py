@@ -46,6 +46,7 @@ def build_step_vectors(task_json: dict):
         meta.append({
             "step_num": step.get("step_num", 0),
             "text": text,
+            "summary": step.get("summary", ""),
             "keywords": step.get("keywords", []),
             "images": step.get("images", [])
         })

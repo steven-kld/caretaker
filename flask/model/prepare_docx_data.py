@@ -12,7 +12,7 @@ OPENAI_API_KEY="sk-proj-..."
 RAW_DIR = Path("raw")
 OUT_DIR = Path("instructions")
 MODEL = "gpt-4-turbo"
-MAX_TOKENS = 1800
+MAX_TOKENS = 2400
 KEY_LINE_PROMPT = """
 Ты анализируешь внутреннюю инструкцию компании, написанную на русском языке.
 
@@ -39,9 +39,10 @@ MAIN_PROMPT = """
   "steps": [
     {
       "step_num": 1,
+      "summary": "обобщенный смысл шага...",
       "text": "инструкция...",
       "images": ["image_0.png", "image_1.png"],
-      "keywords": ["поле", "фильтр", "контрагент"]
+      "keywords": ["поле", "фильтр", "контрагент", "..."]
     }
   ]
 }
@@ -49,6 +50,11 @@ MAIN_PROMPT = """
 title должен быть кратким и отражать основную цель задачи (вводная тебе поможет).
 intro должен быть вставлен как единое текстовое поле (вся вводная часть документа).
 steps - только действия. Не дублируй абзацы из intro туда.
+steps - абсолютно весь предоставленный текст шагов важен и обязательно должен пристуствовать в steps.
+steps - число шагов не должно превышать 3-4 шага, старайся объединить связанные действия в один шаг.
+steps.summary - обобщающий короткий текст, максимум 150 символов.
+steps.text - текст дословно без сокращений (весь текст шагов должен быть использован)
+steps.keywords - добавляй основные ключи, 3-6 ключей.
 """
 
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -121,23 +127,20 @@ def process_docx(docx_path):
     os.makedirs(task_dir, exist_ok=True)
 
     print(f"📄 Processing {task_id}...")
-
     elements = parse_docx_to_elements(docx_path, img_dir)
+
     with open(task_dir / "docx_parsed.json", "w", encoding="utf-8") as f:
         json.dump(elements, f, ensure_ascii=False, indent=2)
 
     entry_line = detect_entry_line(docx_path)
+
     split_index = next((i for i, el in enumerate(elements) if el.get("text") == entry_line), 0)
     intro = "\n".join(el["text"] for el in elements[:split_index] if el["type"] == "normal")
 
-    # Trim intro if too long
-    if len(intro) > 1000:
-        intro = intro[:1000] + "..."
-
     steps = merge_images_to_previous(elements[split_index:])
     payload = { "intro": intro, "steps": steps }
-
     print("🤖 Calling GPT for structure...")
+    
     response = openai_client.chat.completions.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
